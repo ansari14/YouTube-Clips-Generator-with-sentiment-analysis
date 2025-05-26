@@ -2,6 +2,8 @@
 
 A Flask web application that automatically generates engaging Instagram-ready clips from YouTube videos using sentiment analysis.
 
+**Created entirely using Cursor AI without writing a single line of code!**
+
 ## Features
 
 - Automatically identifies the most engaging moments in YouTube videos
@@ -10,12 +12,16 @@ A Flask web application that automatically generates engaging Instagram-ready cl
 - Optimized processing for faster clip generation
 - Web interface to submit YouTube URLs and download clips
 
+## About This Project
+
+This project demonstrates the power of AI-assisted development. The entire application was built by providing instructions to Cursor AI, which generated all the code, making it possible to create a complex application without writing a single line of code manually.
+
 ## Installation
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/ansari14/Clips-cut-url.git
-cd Clips-cut-url
+git clone https://github.com/ansari14/YouTube-Clips-Generator-with-sentiment-analysis.git
+cd YouTube-Clips-Generator-with-sentiment-analysis
 ```
 
 2. Create and activate a virtual environment:
