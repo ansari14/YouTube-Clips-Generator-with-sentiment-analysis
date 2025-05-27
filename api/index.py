@@ -23,10 +23,15 @@ from flask import Flask, render_template, request, jsonify, redirect, url_for, s
 
 app = Flask(__name__, template_folder='../templates', static_folder='../static')
 
+# Add custom Jinja2 filter to extract basename from path
+@app.template_filter('basename')
+def get_basename(path):
+    return os.path.basename(path)
+
 # Constants
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLIPS_DIR = "/tmp/clips_output"  # Use /tmp for Vercel
-TEMP_DIR = "/tmp/temp"  # Use /tmp for Vercel
+CLIPS_DIR = os.path.join(BASE_DIR, "clips_output")  # Changed from /tmp/clips_output
+TEMP_DIR = os.path.join(BASE_DIR, "temp")  # Changed from /tmp/temp
 
 # AssemblyAI API Key - Load from environment variable for security
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "")
@@ -35,17 +40,18 @@ ASSEMBLYAI_HEADERS = {
     "content-type": "application/json"
 }
 
-# Configuration for faster processing
-FAST_MODE = True  # Always use fast mode for Vercel due to time constraints
-MAX_VIDEO_DURATION = 600  # 10 minutes max for Vercel (reduced from 3600)
+# Configuration for processing
+FAST_MODE = True  # Use fast mode for quicker processing
+MAX_VIDEO_DURATION = 7200  # 2 hours max
 MAX_CLIP_DURATION = 30  # Duration of clips in seconds
-MAX_CLIPS = 3  # Maximum number of clips to generate (reduced from 5)
+MAX_CLIPS = 5  # Maximum number of clips to generate
 
 # Create directories
 os.makedirs(CLIPS_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "output", "clips"), exist_ok=True)
 
-# Store processing status in memory (will be lost between serverless invocations)
+# Store processing status in memory
 tasks = {}
 
 def check_dependencies():
@@ -84,8 +90,8 @@ def download_youtube_video(url):
             
         output_filename = os.path.join(TEMP_DIR, f"{video_id}.mp4")
         
-        # Always use lowest quality video for Vercel
-        format_opt = "worst[ext=mp4]/worst"
+        # Use 480p video for better quality while keeping file size reasonable
+        format_opt = "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]/worst[ext=mp4]/worst"
         
         # Skip if file already exists
         if os.path.exists(output_filename):
@@ -96,10 +102,10 @@ def download_youtube_video(url):
         subprocess.run([
             "yt-dlp",
             "-f", format_opt,
-            "--max-filesize", "50M",  # Limit file size for Vercel
+            "--max-filesize", "500M",  # Increased file size limit for longer videos
             "-o", output_filename,
             url
-        ], check=True, capture_output=True, timeout=30)  # 30 second timeout
+        ], check=True, capture_output=True, timeout=120)  # Increased timeout to 2 minutes
         
         if os.path.exists(output_filename):
             print(f"Downloaded video to {output_filename}")
@@ -344,9 +350,13 @@ def get_fallback_timestamps(video_duration):
     """
     Generate evenly spaced timestamps if sentiment analysis fails
     """
-    # If video is shorter than 3 clips, just use beginning, middle, end
+    # If video is shorter than 5 clips, just use beginning, quarter points, and end
     if video_duration <= MAX_CLIPS * MAX_CLIP_DURATION:
-        return [0, video_duration / 2, max(0, video_duration - MAX_CLIP_DURATION)]
+        return [0, 
+                video_duration * 0.2, 
+                video_duration * 0.4, 
+                video_duration * 0.6, 
+                video_duration * 0.8]
     
     # Otherwise, space them evenly
     segment_duration = video_duration / (MAX_CLIPS + 1)
@@ -373,9 +383,9 @@ def get_transcript_segment(transcript, start_time, end_time):
             
     return " ".join(segment_words)
 
-def create_clip_with_subtitles(video_path, start_time, duration, output_filename, subtitle_text):
+def create_clip(video_path, start_time, duration, output_filename):
     """
-    Create a clip with subtitles using ffmpeg directly for better performance on Vercel
+    Create a clip without subtitles using ffmpeg directly for better performance on Vercel
     """
     try:
         # Ensure the output directory exists
@@ -386,38 +396,7 @@ def create_clip_with_subtitles(video_path, start_time, duration, output_filename
             print(f"Using existing clip: {output_filename}")
             return output_filename
         
-        # Create a temporary subtitle file
-        subtitle_file = tempfile.NamedTemporaryFile(suffix=".srt", delete=False)
-        subtitle_path = subtitle_file.name
-        
-        # Split subtitle text into lines (max 40 chars per line)
-        words = subtitle_text.split()
-        lines = []
-        current_line = ""
-        
-        for word in words:
-            if len(current_line) + len(word) + 1 > 40:
-                lines.append(current_line)
-                current_line = word
-            else:
-                if current_line:
-                    current_line += " " + word
-                else:
-                    current_line = word
-                    
-        if current_line:
-            lines.append(current_line)
-            
-        # Write subtitle file
-        with open(subtitle_path, "w") as f:
-            f.write("1\n")
-            f.write("00:00:00,000 --> 00:00:30,000\n")
-            f.write("\n".join(lines))
-        
-        # Create vertical clip with subtitles using ffmpeg
-        temp_output = output_filename + ".temp.mp4"
-        
-        # First create the clip with correct aspect ratio - use lowest quality settings for Vercel
+        # Create vertical clip using ffmpeg - use lowest quality settings for Vercel
         subprocess.run([
             "ffmpeg",
             "-ss", str(start_time),
@@ -431,27 +410,8 @@ def create_clip_with_subtitles(video_path, start_time, duration, output_filename
             "-c:a", "aac",
             "-b:a", "64k",  # Lower audio quality
             "-y",
-            temp_output
-        ], check=True, timeout=45)  # 45 second timeout
-        
-        # Then add subtitles
-        subprocess.run([
-            "ffmpeg",
-            "-i", temp_output,
-            "-vf", f"subtitles={subtitle_path}:force_style='FontSize=16,Alignment=10,BorderStyle=4,Outline=1,Shadow=0,MarginV=30'",  # Smaller font
-            "-c:v", "libx264",
-            "-profile:v", "baseline",
-            "-preset", "ultrafast",
-            "-crf", "30",
-            "-c:a", "copy",
-            "-y",
             output_filename
         ], check=True, timeout=45)  # 45 second timeout
-        
-        # Clean up temporary files
-        os.unlink(subtitle_path)
-        if os.path.exists(temp_output):
-            os.unlink(temp_output)
         
         print(f"Clip created: {output_filename}")
         return output_filename
@@ -467,7 +427,7 @@ def create_clips_sequential(video_path, segments, task_id, transcript, video_dur
     """
     Create clips sequentially instead of in parallel (better for Vercel)
     """
-    tasks[task_id]["message"] = "Creating clips with subtitles..."
+    tasks[task_id]["message"] = "Creating clips..."
     tasks[task_id]["progress"] = 60
     
     clips = []
@@ -477,39 +437,47 @@ def create_clips_sequential(video_path, segments, task_id, transcript, video_dur
         try:
             start_time = segment["start_time"]
             
-            # Get subtitle text from transcript
-            subtitle_text = segment["text"]
-            if not subtitle_text:
-                subtitle_text = get_transcript_segment(transcript, start_time, start_time + MAX_CLIP_DURATION)
-                
-            # If still no text, use a placeholder
-            if not subtitle_text:
-                subtitle_text = f"Clip {i} - {int(start_time // 60)}:{int(start_time % 60):02d}"
-            
             # Generate output filename
             output_filename = os.path.join(CLIPS_DIR, f"clip_{video_id}_{i}_{timestamp}.mp4")
             
             # Create clip
-            clip_path = create_clip_with_subtitles(
+            clip_path = create_clip(
                 video_path,
                 start_time,
                 MAX_CLIP_DURATION,
-                output_filename,
-                subtitle_text
+                output_filename
             )
             
             # Update progress
             progress = 60 + (i * 40) // len(segments)
             tasks[task_id]["progress"] = progress
             
+            # Generate clip description
+            start_time_formatted = f"{int(start_time // 60)}:{int(start_time % 60):02d}"
+            sentiment_text = segment["sentiment"].lower().capitalize()
+            if sentiment_text == "Fallback":
+                sentiment_text = "Auto-selected"
+            
+            description = f"Clip starting at {start_time_formatted}. {sentiment_text} segment."
+            
+            # Ensure confidence score is between 0.5 and 1.0
+            confidence = segment.get("confidence", 0.5)
+            if confidence < 0.5:
+                confidence = 0.5
+            elif confidence > 1.0:
+                confidence = 1.0
+                
             # Add clip to results
+            # Use the correct path format for the download_file function
+            clip_path_for_url = "clips_output/" + os.path.basename(clip_path)
+            
             clips.append({
                 "id": i,
-                "path": os.path.relpath(clip_path, BASE_DIR),
+                "path": clip_path_for_url,
                 "start_time": start_time,
-                "text": subtitle_text,
                 "sentiment": segment["sentiment"],
-                "confidence": segment["confidence"]
+                "confidence": confidence,
+                "description": description
             })
             
         except Exception as e:
@@ -551,15 +519,26 @@ def simple_process_video(url, task_id):
             
         # Create dummy clips info
         clips = []
-        for i in range(1, 4):
+        for i in range(1, 6):  # Changed from range(1, 4) to generate 5 clips
+            start_time = i * 60
+            description = f"Preview image for clip {i} from video '{title}' by {author}. Starting at {i}:00."
+            
+            # Use direct thumbnail URL since it's an external resource
+            thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+            
+            # Generate varying engagement scores for visual interest
+            confidence = 0.5 + (i * 0.1)  # Adjusted formula to spread across 5 clips
+            if confidence > 1.0:
+                confidence = 0.95
+            
             clips.append({
                 "id": i,
-                "path": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
-                "start_time": i * 60,
-                "text": f"Clip {i} from {title}",
+                "path": thumbnail_url,
+                "start_time": start_time,
                 "sentiment": "FALLBACK",
-                "confidence": 0.5,
-                "is_image": True  # Flag to indicate this is just an image, not a video
+                "confidence": confidence,
+                "is_image": True,  # Flag to indicate this is just an image, not a video
+                "description": description
             })
             
         # Update task status
@@ -695,18 +674,36 @@ def download_file(filename):
     Download a generated clip
     """
     try:
+        print(f"Download request for file: {filename}")
+        
         # Extract directory path from filename
         directory = os.path.dirname(filename)
         file_name = os.path.basename(filename)
         
-        # Handle /tmp paths specially
-        if directory.startswith("clips_output"):
-            return send_from_directory(CLIPS_DIR, file_name)
+        # Handle different path scenarios
+        if directory.startswith("clips_output") or directory == "clips_output":
+            print(f"Serving from CLIPS_DIR: {CLIPS_DIR}, file: {file_name}")
+            return send_from_directory(CLIPS_DIR, file_name, as_attachment=True)
+        elif "clips" in directory:
+            # For paths like "output/clips/clip_1.mp4"
+            clips_dir = os.path.join(BASE_DIR, "output", "clips")
+            print(f"Serving from clips_dir: {clips_dir}, file: {file_name}")
+            return send_from_directory(clips_dir, file_name, as_attachment=True)
         else:
-            return send_from_directory(os.path.join(BASE_DIR, directory), file_name)
+            full_path = os.path.join(BASE_DIR, directory)
+            print(f"Serving from full_path: {full_path}, file: {file_name}")
+            return send_from_directory(full_path, file_name, as_attachment=True)
     except Exception as e:
         print(f"Error downloading file: {e}")
-        return f"Error: {str(e)}", 500
+        error_message = f"Error: {str(e)}"
+        # Check if the file exists at the expected path
+        expected_path = os.path.join(CLIPS_DIR, os.path.basename(filename))
+        if os.path.exists(expected_path):
+            error_message += f". File exists at {expected_path} but couldn't be served."
+        else:
+            error_message += f". File does not exist at {expected_path}."
+        
+        return error_message, 500
 
 @app.route('/check_status/<task_id>')
 def check_status(task_id):
@@ -812,5 +809,5 @@ class VercelHandler(BaseHTTPRequestHandler):
 
 # Run the app locally if not on Vercel
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5001))
+    port = int(os.environ.get('PORT', 5002))
     app.run(host='0.0.0.0', port=port, debug=True) 
