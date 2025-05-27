@@ -1,12 +1,6 @@
-flask==2.3.3
-requests==2.31.0
-moviepy==1.0.3
-numpy==1.26.0
-yt-dlp==2023.9.24
-Pillow==10.0.1
-decorator==4.4.2
-imageio==2.31.5
-tqdm==4.66.1
+flask==2.0.1
+requests==2.28.2
+Pillow==9.5.0
 python-dotenv==1.0.0
 gunicorn==21.2.0
 ffmpeg-python==0.2.0

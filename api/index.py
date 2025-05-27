@@ -25,8 +25,8 @@ app = Flask(__name__, template_folder='../templates', static_folder='../static')
 
 # Constants
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLIPS_DIR = os.path.join(BASE_DIR, "clips_output")
-TEMP_DIR = os.path.join(BASE_DIR, "temp")
+CLIPS_DIR = "/tmp/clips_output"  # Use /tmp for Vercel
+TEMP_DIR = "/tmp/temp"  # Use /tmp for Vercel
 
 # AssemblyAI API Key - Load from environment variable for security
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "")
@@ -37,17 +37,35 @@ ASSEMBLYAI_HEADERS = {
 
 # Configuration for faster processing
 FAST_MODE = True  # Always use fast mode for Vercel due to time constraints
-MAX_VIDEO_DURATION = 3600  # 1 hour max to prevent very long processing
+MAX_VIDEO_DURATION = 600  # 10 minutes max for Vercel (reduced from 3600)
 MAX_CLIP_DURATION = 30  # Duration of clips in seconds
-MAX_CLIPS = 5  # Maximum number of clips to generate
+MAX_CLIPS = 3  # Maximum number of clips to generate (reduced from 5)
 
-# Create directories if running locally (not on Vercel)
-if not os.environ.get("VERCEL"):
-    os.makedirs(CLIPS_DIR, exist_ok=True)
-    os.makedirs(TEMP_DIR, exist_ok=True)
+# Create directories
+os.makedirs(CLIPS_DIR, exist_ok=True)
+os.makedirs(TEMP_DIR, exist_ok=True)
 
-# Store processing status
+# Store processing status in memory (will be lost between serverless invocations)
 tasks = {}
+
+def check_dependencies():
+    """
+    Check if required dependencies are available
+    """
+    try:
+        # Check for ffmpeg
+        result = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        if result.returncode != 0:
+            return False, "ffmpeg is not available"
+            
+        # Check for yt-dlp
+        result = subprocess.run(["yt-dlp", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        if result.returncode != 0:
+            return False, "yt-dlp is not available"
+            
+        return True, "All dependencies available"
+    except Exception as e:
+        return False, f"Error checking dependencies: {str(e)}"
 
 def download_youtube_video(url):
     """
@@ -55,26 +73,33 @@ def download_youtube_video(url):
     """
     try:
         print(f"Downloading video from {url}...")
-        video_id = url.split("v=")[1].split("&")[0]  # Extract video ID
+        
+        # Extract video ID with better error handling
+        if "v=" in url:
+            video_id = url.split("v=")[1].split("&")[0] if "&" in url.split("v=")[1] else url.split("v=")[1]
+        elif "youtu.be/" in url:
+            video_id = url.split("youtu.be/")[1].split("?")[0] if "?" in url.split("youtu.be/")[1] else url.split("youtu.be/")[1]
+        else:
+            raise ValueError("Could not extract video ID from URL")
+            
         output_filename = os.path.join(TEMP_DIR, f"{video_id}.mp4")
         
-        # Always use lower quality video for faster processing on Vercel
-        format_opt = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
+        # Always use lowest quality video for Vercel
+        format_opt = "worst[ext=mp4]/worst"
         
-        # Skip if file already exists and is recent (less than 1 hour old)
+        # Skip if file already exists
         if os.path.exists(output_filename):
-            file_age = time.time() - os.path.getmtime(output_filename)
-            if file_age < 3600:  # 1 hour in seconds
-                print(f"Using existing download at {output_filename}")
-                return output_filename, video_id
+            print(f"Using existing download at {output_filename}")
+            return output_filename, video_id
         
+        # Download with timeout for Vercel
         subprocess.run([
             "yt-dlp",
             "-f", format_opt,
-            "--merge-output-format", "mp4",
+            "--max-filesize", "50M",  # Limit file size for Vercel
             "-o", output_filename,
             url
-        ], check=True, capture_output=True)
+        ], check=True, capture_output=True, timeout=30)  # 30 second timeout
         
         if os.path.exists(output_filename):
             print(f"Downloaded video to {output_filename}")
@@ -82,144 +107,149 @@ def download_youtube_video(url):
         else:
             raise ValueError("Video download failed")
             
+    except subprocess.TimeoutExpired:
+        raise Exception("Video download timed out - please try a shorter video")
     except Exception as e:
         print(f"Error downloading video: {e}")
-        raise
+        raise Exception(f"Failed to download video: {str(e)}")
 
 def get_video_duration(video_path):
     """
     Get video duration using ffprobe
     """
-    cmd = [
-        "ffprobe", 
-        "-v", "error", 
-        "-show_entries", "format=duration", 
-        "-of", "default=noprint_wrappers=1:nokey=1", 
-        video_path
-    ]
-    
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    duration = float(result.stdout)
-    
-    # Limit processing to MAX_VIDEO_DURATION
-    return min(duration, MAX_VIDEO_DURATION)
+    try:
+        cmd = [
+            "ffprobe", 
+            "-v", "error", 
+            "-show_entries", "format=duration", 
+            "-of", "default=noprint_wrappers=1:nokey=1", 
+            video_path
+        ]
+        
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        if result.returncode != 0:
+            raise Exception(f"ffprobe error: {result.stderr.decode()}")
+            
+        duration = float(result.stdout)
+        
+        # Limit processing to MAX_VIDEO_DURATION
+        return min(duration, MAX_VIDEO_DURATION)
+    except Exception as e:
+        print(f"Error getting video duration: {e}")
+        # Return a default duration if we can't determine it
+        return MAX_VIDEO_DURATION
 
 def extract_audio(video_path, video_id):
     """
     Extract audio from video for transcription with optimized settings
     """
-    audio_path = os.path.join(TEMP_DIR, f"{video_id}.mp3")
-    
-    # Skip if file already exists and is recent
-    if os.path.exists(audio_path):
-        file_age = time.time() - os.path.getmtime(audio_path)
-        if file_age < 3600:  # 1 hour in seconds
+    try:
+        audio_path = os.path.join(TEMP_DIR, f"{video_id}.mp3")
+        
+        # Skip if file already exists
+        if os.path.exists(audio_path):
             print(f"Using existing audio at {audio_path}")
             return audio_path
-    
-    # Use lower bitrate for faster processing
-    bitrate = "64k"  # Always use lowest bitrate for Vercel
-    
-    subprocess.run([
-        "ffmpeg",
-        "-i", video_path,
-        "-q:a", "5",  # Lower quality for faster processing
-        "-map", "a",
-        "-b:a", bitrate,
-        "-y",
-        audio_path
-    ], check=True, capture_output=True)
-    
-    return audio_path
+        
+        # Use lowest bitrate for Vercel
+        bitrate = "32k"
+        
+        subprocess.run([
+            "ffmpeg",
+            "-i", video_path,
+            "-q:a", "9",  # Lowest quality for faster processing
+            "-map", "a",
+            "-b:a", bitrate,
+            "-y",
+            audio_path
+        ], check=True, capture_output=True, timeout=30)  # 30 second timeout
+        
+        return audio_path
+    except subprocess.TimeoutExpired:
+        raise Exception("Audio extraction timed out")
+    except Exception as e:
+        print(f"Error extracting audio: {e}")
+        raise Exception(f"Failed to extract audio: {str(e)}")
 
 def transcribe_audio(audio_path, task_id):
     """
     Transcribe audio using AssemblyAI API with sentiment analysis
     """
-    tasks[task_id]["message"] = "Uploading audio for transcription..."
-    tasks[task_id]["progress"] = 20
-    
-    # Check if API key is set
-    if not ASSEMBLYAI_API_KEY:
-        raise ValueError("AssemblyAI API key is not set. Please set the ASSEMBLYAI_API_KEY environment variable.")
-    
-    # Step 1: Upload the audio file to AssemblyAI
-    upload_url = "https://api.assemblyai.com/v2/upload"
-    
-    with open(audio_path, "rb") as audio_file:
-        upload_response = requests.post(
-            upload_url,
+    try:
+        tasks[task_id]["message"] = "Uploading audio for transcription..."
+        tasks[task_id]["progress"] = 20
+        
+        # Check if API key is set
+        if not ASSEMBLYAI_API_KEY:
+            raise ValueError("AssemblyAI API key is not set. Please set the ASSEMBLYAI_API_KEY environment variable.")
+        
+        # Step 1: Upload the audio file to AssemblyAI
+        upload_url = "https://api.assemblyai.com/v2/upload"
+        
+        with open(audio_path, "rb") as audio_file:
+            upload_response = requests.post(
+                upload_url,
+                headers=ASSEMBLYAI_HEADERS,
+                data=audio_file,
+                timeout=60  # 60 second timeout
+            )
+        
+        if upload_response.status_code != 200:
+            raise Exception(f"Error uploading audio: {upload_response.text}")
+        
+        audio_url = upload_response.json()["upload_url"]
+        
+        # Step 2: Submit the transcription request with sentiment analysis
+        transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
+        transcript_request = {
+            "audio_url": audio_url,
+            "sentiment_analysis": True,
+            "auto_chapters": True  # Get chapter segmentation for better clip selection
+        }
+        
+        transcript_response = requests.post(
+            transcript_endpoint,
+            json=transcript_request,
             headers=ASSEMBLYAI_HEADERS,
-            data=audio_file
+            timeout=30
         )
-    
-    if upload_response.status_code != 200:
-        raise Exception(f"Error uploading audio: {upload_response.text}")
-    
-    audio_url = upload_response.json()["upload_url"]
-    
-    # Step 2: Submit the transcription request with sentiment analysis
-    transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
-    transcript_request = {
-        "audio_url": audio_url,
-        "sentiment_analysis": True,
-        "auto_chapters": True  # Get chapter segmentation for better clip selection
-    }
-    
-    transcript_response = requests.post(
-        transcript_endpoint,
-        json=transcript_request,
-        headers=ASSEMBLYAI_HEADERS
-    )
-    
-    if transcript_response.status_code != 200:
-        raise Exception(f"Error submitting transcription job: {transcript_response.text}")
-    
-    transcript_id = transcript_response.json()["id"]
-    
-    # Step 3: Poll for transcription completion
-    tasks[task_id]["message"] = "Transcribing audio and analyzing sentiment..."
-    tasks[task_id]["progress"] = 30
-    
-    polling_endpoint = f"https://api.assemblyai.com/v2/transcript/{transcript_id}"
-    
-    # Check if we've already analyzed a part of this video before
-    cached_transcript_path = os.path.join(TEMP_DIR, f"{os.path.basename(audio_path)}.transcript.json")
-    if os.path.exists(cached_transcript_path):
-        try:
-            with open(cached_transcript_path, 'r') as f:
-                cached_data = json.load(f)
-                if cached_data.get('status') == 'completed':
-                    print("Using cached transcript data")
-                    return cached_data
-        except Exception as e:
-            print(f"Error reading cached transcript: {e}")
-    
-    polling_count = 0
-    max_polling = 60  # To prevent infinite loops
-    
-    while polling_count < max_polling:
-        polling_response = requests.get(polling_endpoint, headers=ASSEMBLYAI_HEADERS)
-        polling_response_json = polling_response.json()
         
-        if polling_response_json["status"] == "completed":
-            # Cache the transcript data for future use
-            try:
-                with open(cached_transcript_path, 'w') as f:
-                    json.dump(polling_response_json, f)
-            except Exception as e:
-                print(f"Error caching transcript: {e}")
-                
-            return polling_response_json
-        elif polling_response_json["status"] == "error":
-            raise Exception(f"Transcription error: {polling_response_json['error']}")
+        if transcript_response.status_code != 200:
+            raise Exception(f"Error submitting transcription job: {transcript_response.text}")
         
-        print("Waiting for transcription to complete...")
-        time.sleep(5)
-        polling_count += 1
-    
-    # If we've waited too long, use a fallback approach
-    raise Exception("Transcription timed out - using fallback approach")
+        transcript_id = transcript_response.json()["id"]
+        
+        # Step 3: Poll for transcription completion
+        tasks[task_id]["message"] = "Transcribing audio and analyzing sentiment..."
+        tasks[task_id]["progress"] = 30
+        
+        polling_endpoint = f"https://api.assemblyai.com/v2/transcript/{transcript_id}"
+        
+        polling_count = 0
+        max_polling = 30  # Reduced for Vercel
+        
+        while polling_count < max_polling:
+            polling_response = requests.get(
+                polling_endpoint, 
+                headers=ASSEMBLYAI_HEADERS,
+                timeout=30
+            )
+            polling_response_json = polling_response.json()
+            
+            if polling_response_json["status"] == "completed":
+                return polling_response_json
+            elif polling_response_json["status"] == "error":
+                raise Exception(f"Transcription error: {polling_response_json['error']}")
+            
+            print("Waiting for transcription to complete...")
+            time.sleep(5)
+            polling_count += 1
+        
+        # If we've waited too long, use a fallback approach
+        raise Exception("Transcription timed out - using fallback approach")
+    except Exception as e:
+        print(f"Error in transcription: {e}")
+        raise Exception(f"Failed to transcribe audio: {str(e)}")
 
 def find_engaging_segments(transcript, video_duration, task_id):
     """
@@ -231,56 +261,59 @@ def find_engaging_segments(transcript, video_duration, task_id):
     
     segments = []
     
-    # First check for sentiment analysis results
-    if "sentiment_analysis_results" in transcript and transcript["sentiment_analysis_results"]:
-        # Filter to only positive sentiments with high confidence
-        positive_segments = [
-            s for s in transcript["sentiment_analysis_results"]
-            if s["sentiment"] == "POSITIVE" and s["confidence"] > 0.7  # Lowered threshold for more results
-        ]
-        
-        # Sort by confidence (highest first)
-        positive_segments.sort(key=lambda x: x["confidence"], reverse=True)
-        
-        # Get timestamps for the top segments
-        for segment in positive_segments[:MAX_CLIPS]:
-            start_time = segment["start"] / 1000  # Convert from ms to seconds
+    try:
+        # First check for sentiment analysis results
+        if "sentiment_analysis_results" in transcript and transcript["sentiment_analysis_results"]:
+            # Filter to only positive sentiments
+            positive_segments = [
+                s for s in transcript["sentiment_analysis_results"]
+                if s["sentiment"] == "POSITIVE" and s.get("confidence", 0) > 0.6
+            ]
             
-            # Adjust start time to ensure we get 30 seconds (if possible)
-            adjusted_start = max(0, start_time - 5)  # Start 5 seconds before for context
+            # Sort by confidence (highest first)
+            positive_segments.sort(key=lambda x: x.get("confidence", 0), reverse=True)
             
-            segments.append({
-                "start_time": adjusted_start,
-                "text": segment["text"],
-                "sentiment": segment["sentiment"],
-                "confidence": segment["confidence"]
-            })
-    
-    # If we don't have enough segments from sentiment analysis, try chapters
-    if len(segments) < MAX_CLIPS and "chapters" in transcript and transcript["chapters"]:
-        # Sort chapters by summary (most important first)
-        chapters = sorted(transcript["chapters"], key=lambda x: x["summary_quality_score"], reverse=True)
-        
-        for chapter in chapters:
-            # Skip if we already have enough segments
-            if len(segments) >= MAX_CLIPS:
-                break
+            # Get timestamps for the top segments
+            for segment in positive_segments[:MAX_CLIPS]:
+                start_time = segment["start"] / 1000  # Convert from ms to seconds
                 
-            start_time = chapter["start"] / 1000  # Convert from ms to seconds
-            
-            # Skip if too close to existing segments
-            if any(abs(start_time - s["start_time"]) < MAX_CLIP_DURATION for s in segments):
-                continue
+                # Adjust start time to ensure we get 30 seconds (if possible)
+                adjusted_start = max(0, start_time - 5)  # Start 5 seconds before for context
                 
-            # Adjust start time to ensure we get 30 seconds (if possible)
-            adjusted_start = max(0, start_time)
+                segments.append({
+                    "start_time": adjusted_start,
+                    "text": segment["text"],
+                    "sentiment": segment["sentiment"],
+                    "confidence": segment.get("confidence", 0.5)
+                })
+        
+        # If we don't have enough segments from sentiment analysis, try chapters
+        if len(segments) < MAX_CLIPS and "chapters" in transcript and transcript["chapters"]:
+            # Sort chapters by summary (most important first)
+            chapters = sorted(transcript["chapters"], key=lambda x: x.get("summary_quality_score", 0), reverse=True)
             
-            segments.append({
-                "start_time": adjusted_start,
-                "text": chapter["headline"],
-                "sentiment": "CHAPTER",
-                "confidence": chapter["summary_quality_score"]
-            })
+            for chapter in chapters:
+                # Skip if we already have enough segments
+                if len(segments) >= MAX_CLIPS:
+                    break
+                    
+                start_time = chapter["start"] / 1000  # Convert from ms to seconds
+                
+                # Skip if too close to existing segments
+                if any(abs(start_time - s["start_time"]) < MAX_CLIP_DURATION for s in segments):
+                    continue
+                    
+                # Adjust start time to ensure we get 30 seconds (if possible)
+                adjusted_start = max(0, start_time)
+                
+                segments.append({
+                    "start_time": adjusted_start,
+                    "text": chapter.get("headline", f"Clip at {int(adjusted_start // 60)}:{int(adjusted_start % 60):02d}"),
+                    "sentiment": "CHAPTER",
+                    "confidence": chapter.get("summary_quality_score", 0.5)
+                })
+    except Exception as e:
+        print(f"Error finding segments from transcript: {e}")
     
     # If we still don't have enough segments, use fallback timestamps
     if len(segments) < MAX_CLIPS:
@@ -328,12 +361,15 @@ def get_transcript_segment(transcript, start_time, end_time):
         
     segment_words = []
     
-    for word in transcript["words"]:
-        word_start = word["start"] / 1000  # Convert from ms to seconds
-        word_end = word["end"] / 1000  # Convert from ms to seconds
-        
-        if word_start >= start_time and word_end <= end_time:
-            segment_words.append(word["text"])
+    try:
+        for word in transcript["words"]:
+            word_start = word["start"] / 1000  # Convert from ms to seconds
+            word_end = word["end"] / 1000  # Convert from ms to seconds
+            
+            if word_start >= start_time and word_end <= end_time:
+                segment_words.append(word["text"])
+    except Exception as e:
+        print(f"Error extracting transcript segment: {e}")
             
     return " ".join(segment_words)
 
@@ -381,36 +417,36 @@ def create_clip_with_subtitles(video_path, start_time, duration, output_filename
         # Create vertical clip with subtitles using ffmpeg
         temp_output = output_filename + ".temp.mp4"
         
-        # First create the clip with correct aspect ratio
+        # First create the clip with correct aspect ratio - use lowest quality settings for Vercel
         subprocess.run([
             "ffmpeg",
             "-ss", str(start_time),
             "-i", video_path,
             "-t", str(duration),
-            "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
+            "-vf", "scale=480:854:force_original_aspect_ratio=decrease,pad=480:854:(ow-iw)/2:(oh-ih)/2:color=black",  # Lower resolution
             "-c:v", "libx264",
-            "-profile:v", "main",
-            "-preset", "ultrafast",  # Use ultrafast for Vercel
-            "-crf", "28",  # Higher CRF (lower quality) for faster processing
+            "-profile:v", "baseline",  # More compatible profile
+            "-preset", "ultrafast",
+            "-crf", "30",  # Even lower quality
             "-c:a", "aac",
-            "-b:a", "128k",
+            "-b:a", "64k",  # Lower audio quality
             "-y",
             temp_output
-        ], check=True)
+        ], check=True, timeout=45)  # 45 second timeout
         
         # Then add subtitles
         subprocess.run([
             "ffmpeg",
             "-i", temp_output,
-            "-vf", f"subtitles={subtitle_path}:force_style='FontSize=24,Alignment=10,BorderStyle=4,Outline=1,Shadow=0,MarginV=30'",
+            "-vf", f"subtitles={subtitle_path}:force_style='FontSize=16,Alignment=10,BorderStyle=4,Outline=1,Shadow=0,MarginV=30'",  # Smaller font
             "-c:v", "libx264",
-            "-profile:v", "main",
-            "-preset", "ultrafast",  # Use ultrafast for Vercel
-            "-crf", "28",  # Higher CRF (lower quality) for faster processing
+            "-profile:v", "baseline",
+            "-preset", "ultrafast",
+            "-crf", "30",
             "-c:a", "copy",
             "-y",
             output_filename
-        ], check=True)
+        ], check=True, timeout=45)  # 45 second timeout
         
         # Clean up temporary files
         os.unlink(subtitle_path)
@@ -420,14 +456,16 @@ def create_clip_with_subtitles(video_path, start_time, duration, output_filename
         print(f"Clip created: {output_filename}")
         return output_filename
         
+    except subprocess.TimeoutExpired:
+        print("Clip creation timed out")
+        raise Exception("Clip creation timed out - please try a shorter video")
     except Exception as e:
         print(f"Error creating clip: {e}")
-        print(f"Error creating clip {output_filename}: {e}")
-        raise
+        raise Exception(f"Failed to create clip: {str(e)}")
 
-def create_clips_parallel(video_path, segments, task_id, transcript, video_duration, video_id):
+def create_clips_sequential(video_path, segments, task_id, transcript, video_duration, video_id):
     """
-    Create clips in parallel for faster processing
+    Create clips sequentially instead of in parallel (better for Vercel)
     """
     tasks[task_id]["message"] = "Creating clips with subtitles..."
     tasks[task_id]["progress"] = 60
@@ -435,66 +473,113 @@ def create_clips_parallel(video_path, segments, task_id, transcript, video_durat
     clips = []
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     
-    # Prepare clip creation arguments
-    clip_args = []
     for i, segment in enumerate(segments, 1):
-        start_time = segment["start_time"]
-        
-        # Get subtitle text from transcript
-        subtitle_text = segment["text"]
-        if not subtitle_text:
-            subtitle_text = get_transcript_segment(transcript, start_time, start_time + MAX_CLIP_DURATION)
+        try:
+            start_time = segment["start_time"]
             
-        # If still no text, use a placeholder
-        if not subtitle_text:
-            subtitle_text = f"Clip {i} - {int(start_time // 60)}:{int(start_time % 60):02d}"
-        
-        # Generate output filename
-        output_filename = os.path.join(CLIPS_DIR, f"clip_{video_id}_{i}_{timestamp}.mp4")
-        
-        clip_args.append({
-            "video_path": video_path,
-            "start_time": start_time,
-            "duration": MAX_CLIP_DURATION,
-            "output_filename": output_filename,
-            "subtitle_text": subtitle_text,
-            "segment": segment,
-            "clip_id": i
-        })
-    
-    # Create clips in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = []
-        for args in clip_args:
-            futures.append(executor.submit(
-                create_clip_with_subtitles,
-                args["video_path"],
-                args["start_time"],
-                args["duration"],
-                args["output_filename"],
-                args["subtitle_text"]
-            ))
-        
-        # Process results as they complete
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            try:
-                clip_path = future.result()
-                progress = 60 + (i + 1) * 40 // len(futures)
-                tasks[task_id]["progress"] = progress
+            # Get subtitle text from transcript
+            subtitle_text = segment["text"]
+            if not subtitle_text:
+                subtitle_text = get_transcript_segment(transcript, start_time, start_time + MAX_CLIP_DURATION)
                 
-                # Add clip to results
-                clips.append({
-                    "id": clip_args[i]["clip_id"],
-                    "path": os.path.relpath(clip_path, BASE_DIR),
-                    "start_time": clip_args[i]["start_time"],
-                    "text": clip_args[i]["subtitle_text"],
-                    "sentiment": clip_args[i]["segment"]["sentiment"],
-                    "confidence": clip_args[i]["segment"]["confidence"]
-                })
-            except Exception as e:
-                print(f"Error creating clip {i+1}: {e}")
+            # If still no text, use a placeholder
+            if not subtitle_text:
+                subtitle_text = f"Clip {i} - {int(start_time // 60)}:{int(start_time % 60):02d}"
+            
+            # Generate output filename
+            output_filename = os.path.join(CLIPS_DIR, f"clip_{video_id}_{i}_{timestamp}.mp4")
+            
+            # Create clip
+            clip_path = create_clip_with_subtitles(
+                video_path,
+                start_time,
+                MAX_CLIP_DURATION,
+                output_filename,
+                subtitle_text
+            )
+            
+            # Update progress
+            progress = 60 + (i * 40) // len(segments)
+            tasks[task_id]["progress"] = progress
+            
+            # Add clip to results
+            clips.append({
+                "id": i,
+                "path": os.path.relpath(clip_path, BASE_DIR),
+                "start_time": start_time,
+                "text": subtitle_text,
+                "sentiment": segment["sentiment"],
+                "confidence": segment["confidence"]
+            })
+            
+        except Exception as e:
+            print(f"Error creating clip {i}: {e}")
+            # Continue with next clip
     
     return clips
+
+# Simple fallback function that doesn't rely on external dependencies
+def simple_process_video(url, task_id):
+    """
+    Simple fallback processing that just returns information about the video
+    without actually creating clips - useful when ffmpeg/yt-dlp aren't available
+    """
+    try:
+        # Extract video ID
+        if "v=" in url:
+            video_id = url.split("v=")[1].split("&")[0] if "&" in url.split("v=")[1] else url.split("v=")[1]
+        elif "youtu.be/" in url:
+            video_id = url.split("youtu.be/")[1].split("?")[0] if "?" in url.split("youtu.be/")[1] else url.split("youtu.be/")[1]
+        else:
+            video_id = "unknown"
+            
+        # Get video info using YouTube oEmbed API
+        oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
+        try:
+            response = requests.get(oembed_url, timeout=10)
+            if response.status_code == 200:
+                video_info = response.json()
+                title = video_info.get("title", "Unknown video")
+                author = video_info.get("author_name", "Unknown author")
+            else:
+                title = "YouTube Video"
+                author = "YouTube Creator"
+        except Exception as e:
+            print(f"Error getting video info: {e}")
+            title = "YouTube Video"
+            author = "YouTube Creator"
+            
+        # Create dummy clips info
+        clips = []
+        for i in range(1, 4):
+            clips.append({
+                "id": i,
+                "path": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+                "start_time": i * 60,
+                "text": f"Clip {i} from {title}",
+                "sentiment": "FALLBACK",
+                "confidence": 0.5,
+                "is_image": True  # Flag to indicate this is just an image, not a video
+            })
+            
+        # Update task status
+        tasks[task_id]["status"] = "limited"
+        tasks[task_id]["message"] = "Limited functionality mode: External tools not available on this server"
+        tasks[task_id]["progress"] = 100
+        tasks[task_id]["clips"] = clips
+        tasks[task_id]["video_info"] = {
+            "title": title,
+            "author": author,
+            "video_id": video_id,
+            "thumbnail": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+        }
+        
+    except Exception as e:
+        # Handle errors
+        tasks[task_id]["status"] = "error"
+        tasks[task_id]["message"] = f"Error in simple processing: {str(e)}"
+        tasks[task_id]["progress"] = 0
+        print(f"Error in simple processing: {e}")
 
 def process_video_task(url, task_id):
     """
@@ -509,6 +594,13 @@ def process_video_task(url, task_id):
             "progress": 0,
             "clips": []
         }
+        
+        # Check dependencies
+        deps_ok, deps_message = check_dependencies()
+        if not deps_ok:
+            print(f"Dependencies not available: {deps_message}. Using simple mode.")
+            simple_process_video(url, task_id)
+            return
         
         # Download the video
         tasks[task_id]["message"] = "Downloading video..."
@@ -540,8 +632,8 @@ def process_video_task(url, task_id):
                 })
             transcript = {"words": []}
         
-        # Create clips with subtitles
-        clips = create_clips_parallel(video_path, segments, task_id, transcript, video_duration, video_id)
+        # Create clips with subtitles (sequentially for Vercel)
+        clips = create_clips_sequential(video_path, segments, task_id, transcript, video_duration, video_id)
         
         # Update task status
         tasks[task_id]["status"] = "completed"
@@ -550,11 +642,17 @@ def process_video_task(url, task_id):
         tasks[task_id]["clips"] = clips
         
     except Exception as e:
-        # Handle errors
-        tasks[task_id]["status"] = "error"
-        tasks[task_id]["message"] = f"Error: {str(e)}"
-        tasks[task_id]["progress"] = 0
         print(f"Error processing video: {e}")
+        
+        # Try simple mode as fallback
+        try:
+            simple_process_video(url, task_id)
+        except Exception as fallback_error:
+            # If even the simple mode fails, report the error
+            tasks[task_id]["status"] = "error"
+            tasks[task_id]["message"] = f"Error: {str(e)}"
+            tasks[task_id]["progress"] = 0
+            print(f"Error in fallback processing: {fallback_error}")
 
 @app.route('/')
 def index():
@@ -596,10 +694,19 @@ def download_file(filename):
     """
     Download a generated clip
     """
-    # Extract directory path from filename
-    directory = os.path.dirname(filename)
-    file_name = os.path.basename(filename)
-    return send_from_directory(os.path.join(BASE_DIR, directory), file_name)
+    try:
+        # Extract directory path from filename
+        directory = os.path.dirname(filename)
+        file_name = os.path.basename(filename)
+        
+        # Handle /tmp paths specially
+        if directory.startswith("clips_output"):
+            return send_from_directory(CLIPS_DIR, file_name)
+        else:
+            return send_from_directory(os.path.join(BASE_DIR, directory), file_name)
+    except Exception as e:
+        print(f"Error downloading file: {e}")
+        return f"Error: {str(e)}", 500
 
 @app.route('/check_status/<task_id>')
 def check_status(task_id):
@@ -638,9 +745,70 @@ def api_generate_clips():
         "status_url": f"/check_status/{task_id}"
     })
 
+# Simple health check endpoint
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok"})
+
+# Error handlers
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({
+        "error": "Internal server error",
+        "message": str(e)
+    }), 500
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({
+        "error": "Not found",
+        "message": str(e)
+    }), 404
+
 # Vercel serverless handler
 def handler(event, context):
     return app(event, context)
+
+# Direct handler for Vercel serverless function
+from http.server import BaseHTTPRequestHandler
+import traceback
+
+class VercelHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            # Try to import Flask app
+            from api.index import app
+            
+            # Return a simple status message
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b'YouTube Clips Generator is running!')
+        except Exception as e:
+            # If there's an error, return a helpful error message
+            error_message = f"""
+            <html>
+            <head><title>YouTube Clips Generator - Error</title></head>
+            <body>
+                <h1>Error in Vercel Serverless Function</h1>
+                <p>There was an error starting the application:</p>
+                <pre>{str(e)}</pre>
+                <p>Traceback:</p>
+                <pre>{traceback.format_exc()}</pre>
+                <h2>Troubleshooting Steps:</h2>
+                <ol>
+                    <li>Check if your ASSEMBLYAI_API_KEY environment variable is set</li>
+                    <li>Increase memory allocation in Vercel dashboard (Settings > Functions)</li>
+                    <li>Try processing shorter videos (under 10 minutes)</li>
+                    <li>Check Vercel logs for more details</li>
+                </ol>
+            </body>
+            </html>
+            """
+            self.send_response(500)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(error_message.encode('utf-8'))
 
 # Run the app locally if not on Vercel
 if __name__ == '__main__':

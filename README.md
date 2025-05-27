@@ -17,80 +17,106 @@ A Flask web application that automatically generates engaging Instagram-ready cl
 
 This project demonstrates the power of AI-assisted development. The entire application was built by providing instructions to Cursor AI, which generated all the code, making it possible to create a complex application without writing a single line of code manually.
 
-## Local Installation
+## How It Works
 
-1. Clone this repository:
+1. User submits a YouTube URL through the web interface
+2. The application downloads the video using yt-dlp
+3. Audio is extracted and sent to AssemblyAI for transcription and sentiment analysis
+4. The most engaging segments are identified based on sentiment scores
+5. Clips are created for these segments with proper vertical formatting (9:16 ratio)
+6. Subtitles are added to each clip
+7. User can download the generated clips
+
+## Installation
+
+### Prerequisites
+
+- Python 3.8+
+- ffmpeg
+- yt-dlp
+- AssemblyAI API key
+
+### Setup
+
+1. Clone this repository
 ```bash
-git clone https://github.com/ansari14/YouTube-Clips-Generator-with-sentiment-analysis.git
-cd YouTube-Clips-Generator-with-sentiment-analysis
+git clone https://github.com/yourusername/youtube-clips-generator.git
+cd youtube-clips-generator
 ```
 
-2. Create and activate a virtual environment:
+2. Create a virtual environment
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 ```
 
-3. Install the dependencies:
+3. Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-4. Make sure you have ffmpeg installed on your system:
-   - On Mac: `brew install ffmpeg`
-   - On Ubuntu/Debian: `sudo apt-get install ffmpeg`
-   - On Windows: Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH
-
-5. Get an AssemblyAI API key from [assemblyai.com](https://www.assemblyai.com/) and set it as an environment variable:
+4. Set your AssemblyAI API key
 ```bash
-export ASSEMBLYAI_API_KEY="your_api_key_here"
+export ASSEMBLYAI_API_KEY="your-api-key-here"
+# On Windows: set ASSEMBLYAI_API_KEY=your-api-key-here
 ```
 
-## Local Usage
+## Usage
 
-1. Run the application:
+1. Start the application
 ```bash
-python api/index.py
+python simple_clips.py
 ```
 
 2. Open your browser and go to `http://localhost:5001`
 
-3. Enter a YouTube URL and click "Generate Smart Clips"
+3. Enter a YouTube URL and click "Generate Clips"
 
-4. Wait for the processing to complete (this may take some time depending on the video length)
+4. Wait for the processing to complete
 
 5. Download the generated clips
 
 ## Vercel Deployment
 
-This project is ready to be deployed to Vercel as a serverless application. Follow these steps:
+### Deployment Steps
 
-1. Fork or push this repository to your GitHub account
+1. Fork or clone this repository to your GitHub account
 
-2. Sign up for a Vercel account at [vercel.com](https://vercel.com) if you don't have one
+2. Sign up for a [Vercel account](https://vercel.com/signup) if you don't have one
 
-3. Connect your GitHub account to Vercel
+3. Create a new project in Vercel and import your GitHub repository
 
-4. Create a new project in Vercel and select your repository
+4. Add the following environment variable:
+   - `ASSEMBLYAI_API_KEY`: Your AssemblyAI API key
 
-5. Configure the environment variables:
-   - Add `ASSEMBLYAI_API_KEY` with your AssemblyAI API key
+5. Deploy the application
 
-6. Deploy the project
+### Troubleshooting Vercel Deployment Errors
 
-7. Once deployed, your application will be available at `https://your-project-name.vercel.app`
+If you encounter a "500: INTERNAL_SERVER_ERROR" or "FUNCTION_INVOCATION_FAILED" error when accessing your deployed application, try the following solutions:
 
-### Important Notes for Vercel Deployment
+1. **Check Environment Variables**: Ensure your AssemblyAI API key is correctly set in the Vercel dashboard under Settings > Environment Variables.
 
-- Vercel has limitations for serverless functions:
-  - 10-second execution timeout for free tier (may not be enough for processing long videos)
-  - 50MB maximum deployment size
-  - Limited storage (clips are not permanently stored)
+2. **Increase Function Resources**: In your Vercel dashboard, go to Settings > Functions and increase the Memory allocation to at least 1024MB and Maximum Execution Duration to 60 seconds.
 
-- For production use, consider:
-  - Upgrading to a paid Vercel plan
-  - Using cloud storage like AWS S3 for storing clips
-  - Implementing a queue system for processing longer videos
+3. **Reinstall Dependencies**: In your Vercel dashboard, go to Settings > General > Build & Development Settings and click "Clear Cache and Redeploy".
+
+4. **Check Logs**: In your Vercel dashboard, go to the Deployments tab, click on your latest deployment, and check the Function Logs for specific error messages.
+
+5. **Reduce Video Size**: The serverless environment has limitations. Try processing shorter videos (under 10 minutes) or videos with lower resolution.
+
+6. **Use Simplified Mode**: The application has a fallback "simple mode" that should work even when external dependencies like ffmpeg aren't available. This mode will show video thumbnails instead of creating clips.
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgements
+
+- [AssemblyAI](https://www.assemblyai.com/) for their excellent transcription and sentiment analysis API
+- [Flask](https://flask.palletsprojects.com/) for the web framework
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) for YouTube video downloading
+- [ffmpeg](https://ffmpeg.org/) for video processing
 
 ## Configuration
 
@@ -117,8 +143,4 @@ You can adjust the following settings in the `api/index.py` file:
 ├── requirements.txt      # Python dependencies
 ├── vercel.json           # Vercel configuration
 └── README.md             # This file
-```
-
-## License
-
-MIT 
+``` 
