@@ -28,7 +28,7 @@ CLIPS_DIR = os.path.join(BASE_DIR, "clips_output")
 TEMP_DIR = os.path.join(BASE_DIR, "temp")
 
 # AssemblyAI API Key - Replace with your own API key
-ASSEMBLYAI_API_KEY = "9abcbb4b67c14ad889c85c2f6817ade1"
+ASSEMBLYAI_API_KEY = "9abcbb4b67c14ad889c85c2f68-----1"
 ASSEMBLYAI_HEADERS = {
     "authorization": ASSEMBLYAI_API_KEY,
     "content-type": "application/json"
